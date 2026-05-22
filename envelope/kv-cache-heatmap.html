@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KV$ Sharing: Attention vs KV Cache Creation</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0f;
+    color: #e0e0e0;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 24px;
+  }
+  h1 {
+    font-size: 18px;
+    font-weight: 500;
+    color: #c8c8d0;
+    margin-bottom: 4px;
+    letter-spacing: 0.5px;
+  }
+  .subtitle {
+    font-size: 12px;
+    color: #707080;
+    margin-bottom: 20px;
+  }
+  .chart-container {
+    position: relative;
+    display: inline-block;
+  }
+  canvas#heatmap {
+    display: block;
+    cursor: crosshair;
+  }
+  .legend-container {
+    display: flex;
+    align-items: center;
+    margin-top: 16px;
+    gap: 8px;
+  }
+  canvas#legend {
+    display: block;
+    border-radius: 4px;
+  }
+  .legend-labels {
+    display: flex;
+    justify-content: space-between;
+    width: 300px;
+    font-size: 10px;
+    color: #808090;
+    margin-top: 4px;
+  }
+  .tooltip {
+    position: fixed;
+    background: rgba(20, 20, 30, 0.95);
+    border: 1px solid rgba(100, 100, 140, 0.4);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 12px;
+    pointer-events: none;
+    display: none;
+    z-index: 100;
+    backdrop-filter: blur(8px);
+    line-height: 1.6;
+    min-width: 220px;
+  }
+  .tooltip .label { color: #808090; }
+  .tooltip .value { color: #e0e0e8; font-weight: 500; }
+  .tooltip .ratio-highlight {
+    font-size: 14px;
+    font-weight: 600;
+    margin-top: 4px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(100,100,140,0.3);
+  }
+  .equations {
+    margin-top: 16px;
+    font-size: 11px;
+    color: #606070;
+    text-align: center;
+    line-height: 1.8;
+  }
+  .equations span.attn { color: #ff6b6b; }
+  .equations span.kv { color: #4ecdc4; }
+  .info-row {
+    display: flex;
+    gap: 24px;
+    margin-top: 12px;
+    font-size: 11px;
+  }
+  .info-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .info-swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+  }
+</style>
+</head>
+<body>
+
+<h1>KV$ Sharing &mdash; Attention vs KV Cache Creation Time</h1>
+<div class="subtitle">log-log heatmap &middot; color = attention_time / kv_creation_time</div>
+
+<div class="chart-container">
+  <canvas id="heatmap"></canvas>
+</div>
+
+<div class="legend-container">
+  <span style="font-size:11px; color:#4ecdc4;">KV$ dominates</span>
+  <canvas id="legend" width="300" height="16"></canvas>
+  <span style="font-size:11px; color:#ff6b6b;">Attention dominates</span>
+</div>
+<div class="legend-labels">
+  <span>0.001×</span>
+  <span>0.01×</span>
+  <span>0.1×</span>
+  <span>1×</span>
+  <span>10×</span>
+  <span>100×</span>
+  <span>1000×</span>
+</div>
+
+<div class="info-row">
+  <div class="info-item">
+    <div class="info-swatch" style="background: #ffffff; opacity: 0.8;"></div>
+    <span style="color:#909098;">ratio = 1 (breakeven contour)</span>
+  </div>
+</div>
+
+<div class="equations">
+  <span class="attn">Attention = 0.00718 × (s² + s·c)</span><br>
+  <span class="kv">KV$ creation = 2.28 × c + 3.67 × s</span>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const canvas = document.getElementById('heatmap');
+const ctx = canvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+
+// Dimensions
+const margin = { top: 30, right: 30, bottom: 60, left: 75 };
+const plotW = 700;
+const plotH = 560;
+const W = plotW + margin.left + margin.right;
+const H = plotH + margin.top + margin.bottom;
+
+canvas.width = W * 2;
+canvas.height = H * 2;
+canvas.style.width = W + 'px';
+canvas.style.height = H + 'px';
+ctx.scale(2, 2);
+
+// Log ranges
+const sMin = 1, sMax = 1e6;    // new prompt tokens
+const cMin = 1, cMax = 1e7;    // shared context tokens
+
+const logSMin = Math.log10(sMin), logSMax = Math.log10(sMax);
+const logCMin = Math.log10(cMin), logCMax = Math.log10(cMax);
+
+function attention(s, c) { return 0.00718 * (s * s + s * c); }
+function kvCreation(s, c) { return 2.28 * c + 3.67 * s; }
+
+// Color mapping: ratio -> color
+// ratio < 1: KV dominates (teal/cyan tones)
+// ratio = 1: boundary (white-ish)
+// ratio > 1: attention dominates (red/orange tones)
+function ratioToColor(ratio) {
+  if (ratio <= 0) return [30, 60, 60];
+  const logR = Math.log10(ratio);
+  const t = (logR + 3) / 6; // maps [-3, 3] to [0, 1]
+  const clamped = Math.max(0, Math.min(1, t));
+  return colormap(clamped);
+}
+
+function colormap(t) {
+  // Custom diverging colormap: deep teal -> white -> deep red-orange
+  const stops = [
+    { t: 0.0,  r: 10,  g: 60,  b: 70  },  // deep teal
+    { t: 0.2,  r: 30,  g: 120, b: 130 },  // teal
+    { t: 0.35, r: 78,  g: 205, b: 196 },  // bright teal
+    { t: 0.5,  r: 230, g: 230, b: 235 },  // near-white
+    { t: 0.65, r: 255, g: 150, b: 80  },  // orange
+    { t: 0.8,  r: 255, g: 90,  b: 60  },  // red-orange
+    { t: 1.0,  r: 140, g: 20,  b: 20  },  // deep red
+  ];
+
+  let i = 0;
+  while (i < stops.length - 1 && stops[i + 1].t < t) i++;
+  if (i >= stops.length - 1) return [stops[stops.length-1].r, stops[stops.length-1].g, stops[stops.length-1].b];
+
+  const s0 = stops[i], s1 = stops[i + 1];
+  const f = (t - s0.t) / (s1.t - s0.t);
+  // Smooth interpolation
+  const sf = f * f * (3 - 2 * f);
+  return [
+    Math.round(s0.r + (s1.r - s0.r) * sf),
+    Math.round(s0.g + (s1.g - s0.g) * sf),
+    Math.round(s0.b + (s1.b - s0.b) * sf),
+  ];
+}
+
+// Render heatmap
+const res = 2; // pixel step
+const imageData = ctx.createImageData(plotW * 2, plotH * 2);
+
+for (let py = 0; py < plotH; py++) {
+  for (let px = 0; px < plotW; px++) {
+    const logS = logSMin + (px / plotW) * (logSMax - logSMin);
+    const logC = logCMax - (py / plotH) * (logCMax - logCMin); // flip y
+    const s = Math.pow(10, logS);
+    const c = Math.pow(10, logC);
+
+    const attn = attention(s, c);
+    const kv = kvCreation(s, c);
+    const ratio = attn / kv;
+    const [r, g, b] = ratioToColor(ratio);
+
+    // Write to 2x image
+    for (let dy = 0; dy < 2; dy++) {
+      for (let dx = 0; dx < 2; dx++) {
+        const idx = ((py * 2 + dy) * plotW * 2 + (px * 2 + dx)) * 4;
+        imageData.data[idx] = r;
+        imageData.data[idx + 1] = g;
+        imageData.data[idx + 2] = b;
+        imageData.data[idx + 3] = 255;
+      }
+    }
+  }
+}
+
+ctx.putImageData(imageData, margin.left * 2, margin.top * 2);
+
+// Draw contour line at ratio = 1
+ctx.save();
+ctx.translate(margin.left, margin.top);
+
+// Compute contour points
+ctx.beginPath();
+ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+ctx.lineWidth = 1.8;
+ctx.setLineDash([6, 4]);
+
+let started = false;
+for (let px = 0; px < plotW; px++) {
+  const logS = logSMin + (px / plotW) * (logSMax - logSMin);
+  const s = Math.pow(10, logS);
+
+  // Solve for c where ratio = 1:
+  // 0.00718(s² + sc) = 2.28c + 3.67s
+  // 0.00718s² + 0.00718sc = 2.28c + 3.67s
+  // 0.00718s² - 3.67s = c(2.28 - 0.00718s)
+  // c = (0.00718s² - 3.67s) / (2.28 - 0.00718s)  -- wait let me redo
+  // c(2.28 - 0.00718s) = 0.00718s² - 3.67s
+  // If 2.28 - 0.00718s > 0 (s < 317.5): c = (0.00718s² - 3.67s)/(2.28 - 0.00718s)
+  //   For small s, numerator is negative -> c < 0 -> no solution
+  // If s > 317.5: denominator < 0
+  //   c = (0.00718s² - 3.67s) / (2.28 - 0.00718s)
+  //   numerator positive for s > 511, denom negative -> c < 0
+  //   For 317.5 < s < 511: num could be neg, denom neg -> c positive
+
+  const num = 0.00718 * s * s - 3.67 * s;
+  const den = 2.28 - 0.00718 * s;
+
+  if (Math.abs(den) < 1e-10) continue;
+  const c = num / den;
+
+  if (c < cMin || c > cMax) continue;
+
+  const logC = Math.log10(c);
+  const py = plotH - ((logC - logCMin) / (logCMax - logCMin)) * plotH;
+
+  if (!started) {
+    ctx.moveTo(px, py);
+    started = true;
+  } else {
+    ctx.lineTo(px, py);
+  }
+}
+ctx.stroke();
+ctx.setLineDash([]);
+
+// Axes
+ctx.strokeStyle = '#404050';
+ctx.lineWidth = 1;
+ctx.beginPath();
+ctx.moveTo(0, 0);
+ctx.lineTo(0, plotH);
+ctx.lineTo(plotW, plotH);
+ctx.stroke();
+
+// Grid + labels
+ctx.fillStyle = '#606070';
+ctx.font = '11px SF Mono, Consolas, monospace';
+ctx.textAlign = 'center';
+
+// X-axis ticks
+for (let exp = 0; exp <= 6; exp++) {
+  const x = ((exp - logSMin) / (logSMax - logSMin)) * plotW;
+  ctx.strokeStyle = 'rgba(80,80,100,0.3)';
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, plotH);
+  ctx.stroke();
+
+  ctx.fillStyle = '#808090';
+  ctx.fillText('10' + superscript(exp), x, plotH + 18);
+
+  // Draw superscript properly
+  ctx.fillStyle = '#808090';
+  const label = exp === 0 ? '1' : exp === 1 ? '10' : `10^${exp}`;
+  // Clear and redraw
+}
+
+// Redraw x labels properly
+ctx.fillStyle = '#808090';
+ctx.textAlign = 'center';
+const xLabels = ['1', '10', '10²', '10³', '10⁴', '10⁵', '10⁶'];
+for (let exp = 0; exp <= 6; exp++) {
+  const x = ((exp - logSMin) / (logSMax - logSMin)) * plotW;
+  ctx.fillText(xLabels[exp], x, plotH + 20);
+}
+
+// Y-axis ticks
+ctx.textAlign = 'right';
+const yLabels = ['1', '10', '10²', '10³', '10⁴', '10⁵', '10⁶', '10⁷'];
+for (let exp = 0; exp <= 7; exp++) {
+  const y = plotH - ((exp - logCMin) / (logCMax - logCMin)) * plotH;
+  ctx.strokeStyle = 'rgba(80,80,100,0.3)';
+  ctx.beginPath();
+  ctx.moveTo(0, y);
+  ctx.lineTo(plotW, y);
+  ctx.stroke();
+
+  ctx.fillStyle = '#808090';
+  ctx.fillText(yLabels[exp], -10, y + 4);
+}
+
+// Axis labels
+ctx.fillStyle = '#a0a0b0';
+ctx.font = '13px SF Mono, Consolas, monospace';
+ctx.textAlign = 'center';
+ctx.fillText('s (new prompt tokens)', plotW / 2, plotH + 45);
+
+ctx.save();
+ctx.translate(-55, plotH / 2);
+ctx.rotate(-Math.PI / 2);
+ctx.fillText('c (shared context tokens)', 0, 0);
+ctx.restore();
+
+// Label the contour
+ctx.fillStyle = 'rgba(255,255,255,0.75)';
+ctx.font = '11px SF Mono, Consolas, monospace';
+// Find a good spot on the contour to label
+const labelS = 400;
+const labelLogS = Math.log10(labelS);
+const labelNum = 0.00718 * labelS * labelS - 3.67 * labelS;
+const labelDen = 2.28 - 0.00718 * labelS;
+if (Math.abs(labelDen) > 1e-10) {
+  const labelC = labelNum / labelDen;
+  if (labelC > cMin && labelC < cMax) {
+    const lx = ((labelLogS - logSMin) / (logSMax - logSMin)) * plotW;
+    const ly = plotH - ((Math.log10(labelC) - logCMin) / (logCMax - logCMin)) * plotH;
+    ctx.save();
+    ctx.translate(lx + 40, ly - 12);
+    ctx.rotate(-0.3);
+    ctx.fillText('ratio = 1', 0, 0);
+    ctx.restore();
+  }
+}
+
+ctx.restore();
+
+// Legend bar
+const legCanvas = document.getElementById('legend');
+const legCtx = legCanvas.getContext('2d');
+legCanvas.width = 600;
+legCanvas.height = 32;
+legCanvas.style.width = '300px';
+legCanvas.style.height = '16px';
+
+for (let px = 0; px < 600; px++) {
+  const t = px / 600;
+  const [r, g, b] = colormap(t);
+  legCtx.fillStyle = `rgb(${r},${g},${b})`;
+  legCtx.fillRect(px, 0, 1, 32);
+}
+
+// Tooltip
+canvas.addEventListener('mousemove', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left - margin.left;
+  const my = e.clientY - rect.top - margin.top;
+
+  if (mx < 0 || mx > plotW || my < 0 || my > plotH) {
+    tooltip.style.display = 'none';
+    return;
+  }
+
+  const logS = logSMin + (mx / plotW) * (logSMax - logSMin);
+  const logC = logCMax - (my / plotH) * (logCMax - logCMin);
+  const s = Math.pow(10, logS);
+  const c = Math.pow(10, logC);
+
+  const attn = attention(s, c);
+  const kv = kvCreation(s, c);
+  const ratio = attn / kv;
+
+  const [r, g, b] = ratioToColor(ratio);
+  const ratioColor = ratio > 1 ? '#ff6b6b' : '#4ecdc4';
+  const dominates = ratio > 1 ? 'Attention dominates' : 'KV$ creation dominates';
+
+  function fmt(n) {
+    if (n >= 1e9) return (n/1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
+    if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+    return n.toFixed(1);
+  }
+
+  tooltip.innerHTML = `
+    <div><span class="label">s (new prompt):</span> <span class="value">${fmt(s)} tokens</span></div>
+    <div><span class="label">c (shared ctx):</span> <span class="value">${fmt(c)} tokens</span></div>
+    <div><span class="label">attention time:</span> <span class="value" style="color:#ff6b6b">${fmt(attn)}</span></div>
+    <div><span class="label">KV$ creation:</span> <span class="value" style="color:#4ecdc4">${fmt(kv)}</span></div>
+    <div class="ratio-highlight" style="color:${ratioColor}">
+      ratio: ${ratio.toFixed(3)}× &mdash; ${dominates}
+    </div>
+  `;
+
+  tooltip.style.display = 'block';
+  tooltip.style.left = (e.clientX + 16) + 'px';
+  tooltip.style.top = (e.clientY - 20) + 'px';
+
+  // Keep tooltip on screen
+  const tr = tooltip.getBoundingClientRect();
+  if (tr.right > window.innerWidth - 10) {
+    tooltip.style.left = (e.clientX - tr.width - 16) + 'px';
+  }
+  if (tr.bottom > window.innerHeight - 10) {
+    tooltip.style.top = (e.clientY - tr.height - 10) + 'px';
+  }
+});
+
+canvas.addEventListener('mouseleave', () => {
+  tooltip.style.display = 'none';
+});
+
+function superscript(n) {
+  const sup = '⁰¹²³⁴⁵⁶⁷⁸⁹';
+  return String(n).split('').map(d => sup[parseInt(d)]).join('');
+}
+</script>
+</body>
+</html>
